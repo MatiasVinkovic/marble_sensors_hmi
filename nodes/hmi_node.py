@@ -19,6 +19,9 @@ import tkinter as tk
 from tkinter import ttk
 import threading
 import json
+import os
+import signal
+import subprocess
 import time
 import sys
 
@@ -56,7 +59,8 @@ class SensorPanel(tk.Frame):
     """
 
     def __init__(self, parent, title: str, groups: list,
-                 on_connect=None, default_baud: int = 115200, **kw):
+                 on_connect=None, default_baud: int = 115200,
+                 on_stop=None, **kw):
         super().__init__(parent, bg=PANEL_BG,
                          highlightbackground=BORDER, highlightthickness=1, **kw)
         self._rows = {}  # clé → tk.StringVar(valeur)
@@ -104,7 +108,13 @@ class SensorPanel(tk.Frame):
             tk.Button(bar, text="Connecter", command=self._do_connect,
                       bg=COL_GREEN, fg=BG, font=FONT_LABEL,
                       activebackground=TEXT_SECTION, activeforeground=BG,
-                      relief=tk.FLAT, padx=8).pack(side=tk.LEFT, padx=(6, 10), pady=4)
+                      relief=tk.FLAT, padx=8).pack(side=tk.LEFT, padx=(6, 4), pady=4)
+
+            if on_stop is not None:
+                tk.Button(bar, text="■", command=on_stop,
+                          bg=PANEL_BG, fg=COL_RED, font=FONT_LABEL,
+                          activebackground=BORDER, activeforeground=COL_RED,
+                          relief=tk.FLAT, padx=6).pack(side=tk.LEFT, padx=(0, 10), pady=4)
 
             self._refresh_ports()
 
@@ -184,7 +194,10 @@ class SensorPanel(tk.Frame):
             return
         self._on_connect(port, baud)
         self._dot.config(fg=COL_YELLOW)
-        self._status_var.set(f"Connexion à {port} @ {baud}...")
+
+    def set_status(self, text: str) -> None:
+        """Affiche un message dans la barre de statut du panneau."""
+        self._status_var.set(text)
 
     # ── Mise à jour ───────────────────────────────────────────────────────────
 
@@ -310,8 +323,17 @@ class HMIApp:
         ]),
     ]
 
+    # Exécutables ros2 de chaque capteur (lancés au clic sur Connecter)
+    _EXES = {
+        'aanderaa': 'aanderaa_node',
+        'aquadopp': 'aquadopp_node',
+        'sbe37':    'sbe37_node',
+        'rbrcoda3': 'rbrcoda3_node',
+    }
+
     def __init__(self, node: 'SensorsHMINode'):
         self._node = node
+        self._procs = {}   # sensor → subprocess.Popen des nodes lancés par l'IHM
 
         self._root = tk.Tk()
         self._root.title("MARBLE — Sensors Monitor")
@@ -337,25 +359,29 @@ class HMIApp:
 
         self._a_panel = SensorPanel(
             cols, "AANDERAA Motus Wave Sensor 5729", self.AANDERAA_GROUPS,
-            on_connect=lambda p, b: node.send_set_port('aanderaa', p, b),
+            on_connect=lambda p, b: self._connect('aanderaa', p, b),
+            on_stop=lambda: self._stop('aanderaa'),
             default_baud=115200)
         self._a_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
 
         self._q_panel = SensorPanel(
             cols, "Aquadopp S4VP", self.AQUADOPP_GROUPS,
-            on_connect=lambda p, b: node.send_set_port('aquadopp', p, b),
+            on_connect=lambda p, b: self._connect('aquadopp', p, b),
+            on_stop=lambda: self._stop('aquadopp'),
             default_baud=115200)
         self._q_panel.grid(row=0, column=1, sticky="nsew", padx=(5, 5))
 
         self._s_panel = SensorPanel(
             cols, "SBE 37-SIP MicroCAT", self.SBE37_GROUPS,
-            on_connect=lambda p, b: node.send_set_port('sbe37', p, b),
+            on_connect=lambda p, b: self._connect('sbe37', p, b),
+            on_stop=lambda: self._stop('sbe37'),
             default_baud=9600)
         self._s_panel.grid(row=0, column=2, sticky="nsew", padx=(5, 5))
 
         self._r_panel = SensorPanel(
             cols, "RBRcoda3", self.RBR_GROUPS,
-            on_connect=lambda p, b: node.send_set_port('rbrcoda3', p, b),
+            on_connect=lambda p, b: self._connect('rbrcoda3', p, b),
+            on_stop=lambda: self._stop('rbrcoda3'),
             default_baud=9600)
         self._r_panel.grid(row=0, column=3, sticky="nsew", padx=(5, 0))
 
@@ -373,6 +399,51 @@ class HMIApp:
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._root.after(500, self._tick)
 
+    # ── Lancement / arrêt des nodes capteurs ──────────────────────────────────
+
+    def _panel_of(self, sensor: str) -> SensorPanel:
+        return {'aanderaa': self._a_panel, 'aquadopp': self._q_panel,
+                'sbe37': self._s_panel, 'rbrcoda3': self._r_panel}[sensor]
+
+    def _connect(self, sensor: str, port: str, baud: int) -> None:
+        """Clic sur Connecter : lance le node s'il ne tourne pas, sinon
+        lui demande juste de changer de port à chaud."""
+        proc = self._procs.get(sensor)
+        ihm_proc_alive = proc is not None and proc.poll() is None
+
+        if ihm_proc_alive or self._node.last_msg_age(sensor) < 10.0:
+            # Node déjà actif (lancé par l'IHM ou par un launch externe)
+            self._node.send_set_port(sensor, port, baud)
+            self._panel_of(sensor).set_status(f"Changement de port → {port} @ {baud}...")
+            return
+
+        cmd = ['ros2', 'run', 'marble_sensors_hmi', self._EXES[sensor],
+               '--ros-args', '-p', f'port:={port}', '-p', f'baud:={baud}']
+        kwargs = {'start_new_session': True} if os.name == 'posix' else {}
+        try:
+            self._procs[sensor] = subprocess.Popen(cmd, **kwargs)
+        except FileNotFoundError:
+            self._panel_of(sensor).set_status("⚠ commande 'ros2' introuvable")
+            return
+        self._node.get_logger().info(f"Node {sensor} lancé — {port} @ {baud}")
+        self._panel_of(sensor).set_status(f"Node lancé — connexion à {port} @ {baud}...")
+
+    def _stop(self, sensor: str) -> None:
+        """Clic sur ■ : arrête le node lancé par l'IHM."""
+        proc = self._procs.pop(sensor, None)
+        if proc is None or proc.poll() is not None:
+            self._panel_of(sensor).set_status("Aucun node lancé par l'IHM")
+            return
+        try:
+            if os.name == 'posix':
+                os.killpg(os.getpgid(proc.pid), signal.SIGINT)   # arrêt propre rclpy
+            else:
+                proc.terminate()
+        except (ProcessLookupError, PermissionError):
+            pass
+        self._node.get_logger().info(f"Node {sensor} arrêté")
+        self._panel_of(sensor).set_status("Node arrêté")
+
     # ── Rafraîchissement (500 ms) ─────────────────────────────────────────────
 
     def _tick(self) -> None:
@@ -389,7 +460,16 @@ class HMIApp:
         self._root.after(500, self._tick)
 
     def _on_close(self) -> None:
-        self._node.get_logger().info("Fermeture de l'IHM")
+        self._node.get_logger().info("Fermeture de l'IHM — arrêt des nodes lancés")
+        for sensor, proc in list(self._procs.items()):
+            if proc.poll() is None:
+                try:
+                    if os.name == 'posix':
+                        os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+                    else:
+                        proc.terminate()
+                except (ProcessLookupError, PermissionError):
+                    pass
         self._root.destroy()
 
     def run(self) -> None:
@@ -407,6 +487,7 @@ class SensorsHMINode(Node):
         self._aquadopp  = None
         self._sbe37     = None
         self._rbrcoda3  = None
+        self._last_rx   = {}   # sensor → instant du dernier message reçu
 
         self.create_subscription(String, 'aanderaa/data',  self._cb_aanderaa,  10)
         self.create_subscription(String, 'aquadopp/data',  self._cb_aquadopp,  10)
@@ -429,7 +510,13 @@ class SensorsHMINode(Node):
         self._port_pubs[sensor].publish(msg)
         self.get_logger().info(f"set_port {sensor} → {port} @ {baud}")
 
+    def last_msg_age(self, sensor: str) -> float:
+        """Secondes depuis le dernier message du capteur (inf si jamais reçu)."""
+        t = self._last_rx.get(sensor)
+        return time.time() - t if t else float('inf')
+
     def _cb_aanderaa(self, msg: String) -> None:
+        self._last_rx['aanderaa'] = time.time()
         try:
             with self._lock:
                 self._aanderaa = json.loads(msg.data)
@@ -437,6 +524,7 @@ class SensorsHMINode(Node):
             self.get_logger().warn(f"JSON AANDERAA invalide : {e}")
 
     def _cb_aquadopp(self, msg: String) -> None:
+        self._last_rx['aquadopp'] = time.time()
         try:
             with self._lock:
                 self._aquadopp = json.loads(msg.data)
@@ -444,6 +532,7 @@ class SensorsHMINode(Node):
             self.get_logger().warn(f"JSON Aquadopp invalide : {e}")
 
     def _cb_sbe37(self, msg: String) -> None:
+        self._last_rx['sbe37'] = time.time()
         try:
             with self._lock:
                 self._sbe37 = json.loads(msg.data)
@@ -451,6 +540,7 @@ class SensorsHMINode(Node):
             self.get_logger().warn(f"JSON SBE37 invalide : {e}")
 
     def _cb_rbrcoda3(self, msg: String) -> None:
+        self._last_rx['rbrcoda3'] = time.time()
         try:
             with self._lock:
                 self._rbrcoda3 = json.loads(msg.data)
