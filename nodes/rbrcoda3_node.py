@@ -56,8 +56,33 @@ class RBRcoda3Node(Node):
         self.get_logger().info(
             f"RBRcoda3 node démarré — port={self._port}  baud={self._baud}")
 
+        # Changement de port à chaud depuis l'IHM
+        self._reconnect = False
+        self.create_subscription(String, 'rbrcoda3/set_port', self._cb_set_port, 10)
+
         self._running = True
         threading.Thread(target=self._loop, daemon=True).start()
+
+    def _cb_set_port(self, msg: String) -> None:
+        try:
+            cfg = json.loads(msg.data)
+        except json.JSONDecodeError as e:
+            self.get_logger().warn(f"set_port JSON invalide : {e}")
+            return
+        self._port = cfg.get('port', self._port)
+        try:
+            self._baud = int(cfg.get('baud', self._baud))
+        except (TypeError, ValueError):
+            pass
+        self._reconnect = True
+        self.get_logger().info(f"Changement de port demandé → {self._port} @ {self._baud}")
+
+    def _sleep(self, seconds: float) -> None:
+        """Attente interruptible par arrêt du node ou changement de port."""
+        for _ in range(int(seconds / 0.1)):
+            if not self._running or self._reconnect:
+                return
+            time.sleep(0.1)
 
     # ── Publication ───────────────────────────────────────────────────────────
 
@@ -123,6 +148,7 @@ class RBRcoda3Node(Node):
     def _loop(self) -> None:
         while self._running:
             try:
+                self._reconnect = False
                 conn = serial.Serial(
                     self._port, self._baud,
                     bytesize=8, parity='N', stopbits=1, timeout=1.0,
@@ -145,7 +171,7 @@ class RBRcoda3Node(Node):
                 last_pub  = 0.0
                 last_data = time.time()
 
-                while self._running:
+                while self._running and not self._reconnect:
                     line = conn.readline().decode('ascii', errors='ignore').strip()
                     sample = parse_stream(line) if line else None
 
@@ -184,10 +210,10 @@ class RBRcoda3Node(Node):
             except serial.SerialException as e:
                 self.get_logger().error(f"Erreur série : {e} — reconnexion dans 10 s")
                 self._publish({'status': 'error', 'error': str(e)})
-                time.sleep(10.0)
+                self._sleep(10.0)
             except Exception as e:
                 self.get_logger().error(f"Erreur inattendue : {e}")
-                time.sleep(5.0)
+                self._sleep(5.0)
 
     def destroy_node(self) -> None:
         self._running = False

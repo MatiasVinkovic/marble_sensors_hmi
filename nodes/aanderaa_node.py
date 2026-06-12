@@ -1,29 +1,4 @@
 #!/usr/bin/env python3
-"""
-ROS 2 node — AANDERAA Motus Wave Sensor 5729 (mode SST).
-
-Publie : /aanderaa/data  (std_msgs/String, JSON)
-
-Format JSON publié :
-  { "status": "ok" | "error" | "no_data",
-    "timestamp": "HH:MM:SS",            (si status == ok)
-    "error": "...",                      (si status == error)
-    "fields": {                          (si status == ok)
-      "<field_name>": {
-        "value":   <float>,
-        "unit":    "<str>",
-        "display": "<str>"
-      }, ...
-    }
-  }
-
-Paramètres ROS 2 (surchargeables via launch ou CLI) :
-  port            /dev/ttyUSB1
-  baud            115200
-  passkey         1
-  sample_interval 10   (secondes entre deux mesures)
-"""
-
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
@@ -33,98 +8,10 @@ import time
 import json
 import threading
 
-# ─── Champs scalaires à extraire ─────────────────────────────────────────────
+from marble_sensors_hmi.drivers.aanderaa_driver import (
+    read_all, sst, parse_do_output, fmt, SCALAR_FIELDS
+)
 
-SCALAR_FIELDS = {
-    "Pitch", "Roll", "Heading",
-    "StDev Pitch", "StDev Roll", "StDev Heading",
-    "Significant Wave Height Hm0",
-    "Wave Height Wind Hm0", "Wave Height Swell Hm0",
-    "Wave Height H1/3", "Wave Height Hmax",
-    "Wave Mean Period Tz", "Wave Mean Period Tm02",
-    "Wave Peak Period Wind", "Wave Peak Period Swell",
-    "Wave Peak Direction", "Wave Peak Direction Wind", "Wave Peak Direction Swell",
-    "Wave Mean Direction", "Mean Spreading Angle",
-    "Input Voltage", "Input Current", "Memory Used",
-}
-
-# ─── Fonctions driver (extraites de test_aanderaa.py) ────────────────────────
-
-def _read_all(ser, seconds: float) -> bytes:
-    buf = b""
-    deadline = time.time() + seconds
-    last_rx = time.time()
-    while time.time() < deadline:
-        n = ser.in_waiting
-        if n:
-            buf += ser.read(n)
-            last_rx = time.time()
-        else:
-            if buf and (time.time() - last_rx) > 0.5:
-                break
-            time.sleep(0.01)
-    return buf
-
-
-def _sst(ser, cmd: str, wait: float = 3.0) -> str:
-    ser.reset_input_buffer()
-    ser.write((cmd + "\r\n").encode("ascii"))
-    raw = _read_all(ser, wait)
-    return raw.decode("ascii", errors="replace") if raw else ""
-
-
-def _parse_do_output(text: str) -> dict:
-    data = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if not line.startswith("MEASUREMENT"):
-            continue
-        parts = line.split("\t")
-        i = 3
-        current_name = None
-        current_unit = ""
-        while i < len(parts):
-            p = parts[i].strip()
-            if p.startswith("*"):
-                raw = p[1:]
-                if "[" in raw and "]" in raw:
-                    bracket = raw.index("[")
-                    current_name = raw[:bracket].strip()
-                    current_unit = raw[bracket + 1:raw.index("]")]
-                else:
-                    current_name = raw.strip()
-                    current_unit = ""
-                i += 1
-            elif current_name and p:
-                if current_name not in data:
-                    data[current_name] = (p, current_unit)
-                i += 1
-            else:
-                i += 1
-    return data
-
-
-def _fmt(raw_val: str, unit: str) -> str:
-    try:
-        f = float(raw_val)
-        if unit in ("Bytes", "") and f == int(f):
-            return str(int(f))
-        if "Deg" in unit or unit in ("deg", "°"):
-            return f"{f:.1f}"
-        if unit == "m":
-            return f"{f:.3f}"
-        if unit == "s":
-            return f"{f:.2f}"
-        if unit in ("V", "mA"):
-            return f"{f:.2f}"
-        if abs(f) >= 1000 or (abs(f) < 0.001 and f != 0):
-            return f"{f:.3e}"
-        return f"{f:.3f}"
-    except ValueError:
-        return raw_val
-
-
-# ─── Nœud ROS 2 ──────────────────────────────────────────────────────────────
 
 class AanderaaNode(Node):
 
@@ -142,25 +29,46 @@ class AanderaaNode(Node):
         self._interval = self.get_parameter('sample_interval').value
 
         self._pub = self.create_publisher(String, 'aanderaa/data', 10)
-        self.get_logger().info(
-            f"AANDERAA node démarré — port={self._port}  baud={self._baud}")
+        self.get_logger().info(f"AANDERAA node démarré — port={self._port}  baud={self._baud}")
+
+        # Changement de port à chaud depuis l'IHM
+        self._reconnect = False
+        self.create_subscription(String, 'aanderaa/set_port', self._cb_set_port, 10)
 
         self._running = True
         threading.Thread(target=self._loop, daemon=True).start()
 
-    # ── Publication helper ────────────────────────────────────────────────────
+    def _cb_set_port(self, msg: String) -> None:
+        try:
+            cfg = json.loads(msg.data)
+        except json.JSONDecodeError as e:
+            self.get_logger().warn(f"set_port JSON invalide : {e}")
+            return
+        self._port = cfg.get('port', self._port)
+        try:
+            self._baud = int(cfg.get('baud', self._baud))
+        except (TypeError, ValueError):
+            pass
+        self._reconnect = True
+        self.get_logger().info(f"Changement de port demandé → {self._port} @ {self._baud}")
+
+    def _sleep(self, seconds: float) -> None:
+        """Attente interruptible par arrêt du node ou changement de port."""
+        for _ in range(int(seconds / 0.1)):
+            if not self._running or self._reconnect:
+                return
+            time.sleep(0.1)
 
     def _publish(self, payload: dict) -> None:
         msg = String()
         msg.data = json.dumps(payload)
         self._pub.publish(msg)
 
-    # ── Boucle série (thread séparé) ──────────────────────────────────────────
-
     def _loop(self) -> None:
         while self._running:
             try:
-                ser = serial.Serial(
+                self._reconnect = False
+                conn = serial.Serial(
                     port=self._port, baudrate=self._baud,
                     bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
                     stopbits=serial.STOPBITS_ONE,
@@ -168,28 +76,21 @@ class AanderaaNode(Node):
                     timeout=0.05,
                 )
                 self.get_logger().info("Port série ouvert — wake-up...")
-
-                # Wake-up SST
-                ser.reset_input_buffer()
-                ser.write(b"\r")
-                resp = _read_all(ser, 2.0).decode("ascii", errors="replace")
-                if "!" in resp:
+                conn.reset_input_buffer()
+                conn.write(b'\r')
+                resp = read_all(conn, 2.0).decode('ascii', errors='replace')
+                if '!' in resp:
                     self.get_logger().info("SST wake-up confirmé")
-                time.sleep(0.2)
 
-                # Passkey
-                r = _sst(ser, f"Set Passkey({self._passkey})")
-                if '#' in r:
-                    self.get_logger().info("Passkey OK")
-                else:
+                r = sst(conn, f'Set Passkey({self._passkey})')
+                if '#' not in r:
                     self.get_logger().warn(f"Passkey réponse inattendue : {r.strip()[:40]}")
 
-                # Boucle de mesure
-                while self._running:
-                    _sst(ser, "Do Sample", wait=6.0)
+                while self._running and not self._reconnect:
+                    sst(conn, 'Do Sample', wait=6.0)
                     time.sleep(0.3)
-                    r_out = _sst(ser, "Do Output", wait=6.0)
-                    raw_data = _parse_do_output(r_out)
+                    r_out    = sst(conn, 'Do Output', wait=6.0)
+                    raw_data = parse_do_output(r_out)
 
                     if raw_data:
                         fields = {}
@@ -200,39 +101,29 @@ class AanderaaNode(Node):
                                 fval = float(raw_val)
                             except ValueError:
                                 continue
-                            fields[field] = {
-                                'value':   fval,
-                                'unit':    unit,
-                                'display': _fmt(raw_val, unit),
-                            }
-                        self._publish({
-                            'status':    'ok',
-                            'timestamp': time.strftime('%H:%M:%S'),
-                            'fields':    fields,
-                        })
+                            fields[field] = {'value': fval, 'unit': unit, 'display': fmt(raw_val, unit)}
+                        self._publish({'status': 'ok', 'timestamp': time.strftime('%H:%M:%S'), 'fields': fields})
                         self.get_logger().info(f"Publié {len(fields)} champs")
                     else:
                         self._publish({'status': 'no_data'})
-                        self.get_logger().warn("Aucune donnée parsée dans Do Output")
+                        self.get_logger().warn("Aucune donnée parsée")
 
-                    time.sleep(self._interval)
+                    self._sleep(self._interval)
 
-                ser.close()
+                conn.close()
 
             except serial.SerialException as e:
                 self.get_logger().error(f"Erreur série : {e} — reconnexion dans 5 s")
                 self._publish({'status': 'error', 'error': str(e)})
-                time.sleep(5.0)
+                self._sleep(5.0)
             except Exception as e:
                 self.get_logger().error(f"Erreur inattendue : {e}")
-                time.sleep(5.0)
+                self._sleep(5.0)
 
     def destroy_node(self) -> None:
         self._running = False
         super().destroy_node()
 
-
-# ─── Entry point ──────────────────────────────────────────────────────────────
 
 def main(args=None):
     rclpy.init(args=args)
